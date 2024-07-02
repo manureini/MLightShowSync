@@ -1,0 +1,231 @@
+﻿@page "/"
+@using System.Timers
+@using MLightShowSync.Models
+
+@inject AudioService AudioService
+@inject IJSRuntime JS
+
+<PageTitle>Home</PageTitle>
+
+
+<div class="waterfall-page-container" style="background: @(mActiveMaker?.Color)">
+
+    <div class="waterfall-menu">
+
+        <InputNumber @bind-Value="mMoveOffset" DisplayName="Move Offset" />
+
+    </div>
+
+    <div class="waterfall-container" @ref="_imgContainer" @onwheel="OnMouseWheel" @onwheel:preventDefault @onwheel:stopPropagation>
+        <div id="waterfall-cursor" style="left: @(mCursorOffset)px" />
+        <div id="audio-cursor" style="left: @(mAudioCursorOffset)px" />
+
+        @foreach (var marker in mMarkers)
+        {
+            var pos = (int)(marker.PositionPercent * mWaterfallWidth);
+            <div class="waterfall-marker @(mSelectedMarker == marker ? "selected" : string.Empty)" style="left: @(pos)px; background: @(marker.Color)" @onclick="() => SelectMarker(marker)" />
+        }
+
+        <img id="waterfall-image" @onclick="OnImageClick" />
+    </div>
+
+    <audio id="player">
+        <source id="playerSource" src="">
+    </audio>
+
+
+    <button @onclick="OnBtn">
+        Set Image
+    </button>
+
+</div>
+
+
+@code {
+
+
+    protected double mMoveOffset = 0.0001;
+
+    protected int mWaterfallWidth = 3000;
+    protected int mCursorOffset = 0;
+    protected int mAudioCursorOffset = 0;
+
+    protected ElementReference _imgContainer;
+
+    protected string mSongUrl = "audio/test.mp3";
+    protected string mInternalPath => "wwwroot/" + mSongUrl;
+
+    protected double mSongLength = 0;
+    protected bool mAudioPlaying;
+
+    protected Marker? mSelectedMarker;
+
+    protected System.Timers.Timer mTimer = new System.Timers.Timer(100);
+
+    protected List<Marker> mMarkers = new();
+    protected int mActiveMarkerIndex = 0;
+    protected Marker? mActiveMaker;
+
+    private DotNetObjectReference<Home> mThisReference;
+
+    protected override void OnInitialized()
+    {
+        mThisReference = DotNetObjectReference.Create(this);
+
+        mSongLength = AudioService.GetSongLength(mInternalPath);
+
+        mTimer.Elapsed += OnTimeElapsed;
+        mTimer.Start();
+    }
+
+    public async Task OnBtn()
+    {
+        await Update();
+        await JS.InvokeVoidAsync("playAudio");
+        mAudioPlaying = true;
+        mTimer.Stop();
+    }
+
+    protected void OnTimeElapsed(object? sender, ElapsedEventArgs e)
+    {
+        mTimer.Stop();
+        InvokeAsync(async () =>
+        {
+            var audioPos = await JS.InvokeAsync<double>("getAudioPosition");
+            var percent = audioPos / mSongLength;
+            mAudioCursorOffset = (int)(mWaterfallWidth * percent);
+
+            if ((mMarkers.Count > mActiveMarkerIndex + 1) && (mMarkers[mActiveMarkerIndex + 1].PositionPercent <= percent))
+            {
+                mActiveMaker = mMarkers[mActiveMarkerIndex + 1];
+                mActiveMarkerIndex++;
+            }
+
+            StateHasChanged();
+            mTimer.Start();
+        });
+    }
+
+    protected async Task Update()
+    {
+        var stream = AudioService.CreateSpectrogram(mInternalPath, mWaterfallWidth);
+
+        var dotnetImageStream = new DotNetStreamReference(stream);
+        await JS.InvokeVoidAsync("setImage", "waterfall-image", dotnetImageStream);
+    }
+
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            await JS.InvokeVoidAsync("setKeyListener", mThisReference);
+            await JS.InvokeVoidAsync("addDefaultPreventingHandler", _imgContainer, "wheel");
+            await JS.InvokeVoidAsync("loadAudioFile", mSongUrl);
+            await Update();
+        }
+    }
+
+    protected async Task OnImageClick(MouseEventArgs args)
+    {
+        mCursorOffset = (int)args.OffsetX;
+
+        var percent = (double)mCursorOffset / mWaterfallWidth;
+
+        var audioSeconds = mSongLength * percent;
+
+        await JS.InvokeVoidAsync("seekAudio", audioSeconds);
+
+        mActiveMaker = null;
+        mActiveMarkerIndex = -1;
+
+        for (int i = 0; i < mMarkers.Count; i++)
+        {
+            var marker = mMarkers[i];
+
+            if (marker.PositionPercent <= percent)
+            {
+                mActiveMaker = marker;
+                mActiveMarkerIndex = i;
+                continue;
+            }
+
+            break;
+        }
+
+    }
+
+    protected void SelectMarker(Marker pMarker)
+    {
+        mSelectedMarker = pMarker;
+    }
+
+    [JSInvokable]
+    public async void OnKeyDown(string key)
+    {
+        if (key == "Space")
+        {
+            if (mAudioPlaying)
+            {
+                await JS.InvokeVoidAsync("pauseAudio");
+            }
+            else
+            {
+                await JS.InvokeVoidAsync("playAudio");
+            }
+
+            mAudioPlaying = !mAudioPlaying;
+        }
+        else if (key == "KeyM")
+        {
+            mMarkers.Add(new Marker()
+                {
+                    Color = "white",
+                    PositionPercent = mAudioCursorOffset / (double)mWaterfallWidth
+                });
+
+            mMarkers = mMarkers.OrderBy(m => m.PositionPercent).ToList();
+        }
+        else if (key == "BracketRight")
+        {
+            if (mSelectedMarker != null)
+            {
+                mSelectedMarker.PositionPercent += mMoveOffset;
+            }
+        }
+        else if (key == "Slash")
+        {
+            if (mSelectedMarker != null)
+            {
+                mSelectedMarker.PositionPercent -= mMoveOffset;
+            }
+        }
+
+        if (key == "KeyR")
+        {
+            if (mSelectedMarker != null)
+                mSelectedMarker.Color = "red";
+        }
+        if (key == "KeyG")
+        {
+            if (mSelectedMarker != null)
+                mSelectedMarker.Color = "green";
+        }
+
+        StateHasChanged();
+    }
+
+    protected async Task OnMouseWheel(WheelEventArgs args)
+    {
+        if (args.CtrlKey)
+        {
+            mWaterfallWidth -= (int)args.DeltaY * 3;
+
+            mWaterfallWidth = Math.Max(0, mWaterfallWidth);
+            mWaterfallWidth = Math.Min(20000, mWaterfallWidth);
+
+            await Update();
+        }
+    }
+
+}
